@@ -81,3 +81,37 @@ package typeurl
 //
 // The correct type is automatically chosen from the type registry, and the
 // returned interface can be cast straight to that type.
+//
+// # Versioned registries
+//
+// The package-level Register and Unmarshal functions maintain a single global
+// mapping from type URL to Go type. That is convenient, but it cannot express a
+// plugin reload that brings in a new Go type for the same type URL: whichever
+// registration happens last wins, and the decode result depends on load order.
+//
+// Registry and Snapshot add an explicit, versioned alternative:
+//
+//   reg := typeurl.NewRegistry("my-plugin")
+//   err := reg.Register(typeurl.Entry{
+//       TypeURL: "types.example.com/greeting",
+//       Version: "v2",
+//       GoType:  reflect.TypeOf(greetingV2{}),
+//       Source:  typeurl.Source{Name: "my-plugin", Detail: "build-42"},
+//   })
+//   snapshot := reg.Snapshot()
+//   anyGreeting, err := snapshot.MarshalAny(&greetingV2{Name: "hello"})
+//
+// Versions are encoded on the wire as a "#"-suffixed, path-escaped suffix
+// (EncodeTypeURL / DecodeTypeURL). The default version has no suffix, so every
+// type URL produced by the historical Register function is byte-for-byte
+// unchanged. A wire URL that declares a version decodes only with that
+// version; a URL without one uses the snapshot's selection rule, which by
+// default prefers the unversioned registration and otherwise the highest
+// version by natural order.
+//
+// A Snapshot is immutable: operations keep using one snapshot until the caller
+// switches atomically with Registry.SetSnapshot. Registering, freezing,
+// switching and unloading are safe concurrently, and unloading a Source removes
+// exactly the entries a plugin contributed. The package-level functions remain
+// compatible and delegate to a default Registry after consulting the legacy
+// table.

@@ -32,7 +32,35 @@ import (
 var (
 	mu       sync.RWMutex
 	registry = make(map[reflect.Type]string)
+
+	// defaultRegistry backs the package-level versioned API. It is kept
+	// separate from the legacy registry map so that the historical Register
+	// behavior, including its panic on alternate URLs, is unchanged.
+	defaultRegistry = NewRegistry("typeurl")
 )
+
+// DefaultRegistry returns the versioned registry used by the package-level
+// versioned helpers. Entries registered here are also resolvable through the
+// package-level Unmarshal functions; the legacy Register table is consulted
+// first, so existing registrations keep their exact meaning.
+func DefaultRegistry() *Registry { return defaultRegistry }
+
+// RegisterVersioned registers v in DefaultRegistry under typeURL at version.
+// See Registry.Register for conflict and freeze semantics. Unlike Register it
+// reports conflicts as errors instead of panicking and never overwrites an
+// existing registration.
+func RegisterVersioned(v interface{}, typeURL string, version Version, source Source) error {
+	return defaultRegistry.RegisterType(v, typeURL, version, source)
+}
+
+// UnregisterSource removes all registrations that DefaultRegistry attributes
+// to source and returns how many were removed. It is intended for unloading a
+// plugin: the next Snapshot (and thus the next Marshal/Unmarshal) no longer
+// sees those entries, while operations already using an older snapshot are
+// unaffected.
+func UnregisterSource(source Source) (int, error) {
+	return defaultRegistry.UnregisterSource(source)
+}
 
 // Definitions of common error types used throughout typeurl.
 //
@@ -108,6 +136,9 @@ func TypeURL(v interface{}) (string, error) {
 	u, ok := registry[tryDereference(v)]
 	mu.RUnlock()
 	if !ok {
+		if u, err := defaultRegistry.Snapshot().TypeURL(v); err == nil {
+			return u, nil
+		}
 		switch t := v.(type) {
 		case proto.Message:
 			return string(t.ProtoReflect().Descriptor().FullName()), nil
@@ -124,12 +155,32 @@ func Is(any Any, v interface{}) bool {
 		return false
 	}
 	// call to check that v is a pointer
-	tryDereference(v)
-	url, err := TypeURL(v)
+	t := tryDereference(v)
+	mu.RLock()
+	url, legacy := registry[t]
+	mu.RUnlock()
+	if legacy && any.GetTypeUrl() == url {
+		return true
+	}
+	// A type may be registered at several versions; Is matches any of its
+	// wire URLs, so callers do not need to know which version is current.
+	// For a legacy-only registration this loop is empty and the result is
+	// unchanged.
+	if snapshot := defaultRegistry.Snapshot(); snapshot != nil {
+		for _, e := range snapshot.byGoType[t] {
+			if any.GetTypeUrl() == e.WireTypeURL() {
+				return true
+			}
+		}
+	}
+	if legacy {
+		return false
+	}
+	registered, err := TypeURL(v)
 	if err != nil {
 		return false
 	}
-	return any.GetTypeUrl() == url
+	return any.GetTypeUrl() == registered
 }
 
 // MarshalAny marshals the value v into an any with the correct TypeUrl.
@@ -137,11 +188,27 @@ func Is(any Any, v interface{}) bool {
 // returned verbatim. If it is of type proto.Message, it will be marshaled as a
 // protocol buffer. Otherwise, the object will be marshaled to json.
 func MarshalAny(v interface{}) (Any, error) {
+	if a, ok := v.(Any); ok {
+		// avoid reserializing the type if we have an any.
+		return a, nil
+	}
+
+	// Types registered through the versioned API are encoded by a single
+	// snapshot so that the type URL and the codec always agree.
+	if t, err := typeOf(v); err == nil {
+		mu.RLock()
+		_, legacy := registry[t]
+		mu.RUnlock()
+		if !legacy {
+			snapshot := defaultRegistry.Snapshot()
+			if _, ok := snapshot.Lookup(v); ok {
+				return snapshot.MarshalAny(v)
+			}
+		}
+	}
+
 	var marshal func(v interface{}) ([]byte, error)
 	switch t := v.(type) {
-	case Any:
-		// avoid reserializing the type if we have an any.
-		return t, nil
 	case proto.Message:
 		marshal = func(v interface{}) ([]byte, error) {
 			return proto.Marshal(t)
@@ -216,11 +283,39 @@ func MarshalAnyToProto(from interface{}) (*anypb.Any, error) {
 }
 
 func unmarshal(typeURL string, value []byte, v interface{}) (interface{}, error) {
+	// The legacy Register table has precedence and keeps its exact
+	// semantics: a match there always decodes as JSON.
+	mu.RLock()
+	var legacyType reflect.Type
+	for t, u := range registry {
+		if u == typeURL {
+			legacyType = t
+			break
+		}
+	}
+	mu.RUnlock()
+
+	if legacyType != nil {
+		return decodeLegacy(legacyType, false, typeURL, value, v)
+	}
+
+	// Then consult the versioned default registry. A wire URL carrying a
+	// version suffix resolves only to that version.
+	snapshot := defaultRegistry.Snapshot()
+	if e, err := snapshot.LookupWireURL(typeURL); err == nil {
+		return snapshot.decode(e, value, v)
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
 	t, isProto, err := getTypeByUrl(typeURL)
 	if err != nil {
 		return nil, err
 	}
+	return decodeLegacy(t, isProto, typeURL, value, v)
+}
 
+func decodeLegacy(t reflect.Type, isProto bool, typeURL string, value []byte, v interface{}) (interface{}, error) {
 	if v == nil {
 		v = reflect.New(t).Interface()
 	} else {
@@ -237,23 +332,14 @@ func unmarshal(typeURL string, value []byte, v interface{}) (interface{}, error)
 	if isProto {
 		pm, ok := v.(proto.Message)
 		if ok {
-			err = proto.Unmarshal(value, pm)
+			err := proto.Unmarshal(value, pm)
 			return v, err
 		}
 	}
 	return v, json.Unmarshal(value, v)
-
 }
 
 func getTypeByUrl(url string) (_ reflect.Type, isProto bool, _ error) {
-	mu.RLock()
-	for t, u := range registry {
-		if u == url {
-			mu.RUnlock()
-			return t, false, nil
-		}
-	}
-	mu.RUnlock()
 	mt, err := protoregistry.GlobalTypes.FindMessageByURL(url)
 	if err != nil {
 		return nil, false, fmt.Errorf("type with url %s: %w", url, ErrNotFound)
